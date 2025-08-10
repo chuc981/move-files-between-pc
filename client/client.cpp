@@ -6,12 +6,15 @@
 #include <ws2tcpip.h>
 #include <fstream>
 #include <filesystem>
-#include <vector>
-#include <chrono>
 #include <thread>
+#include <sstream>
+#include <vector>
+#include <windows.h>
+#include <chrono>
 namespace fs = std::filesystem;
 
 #pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "gdi32.lib")
 
 class Vector2 {
 public:
@@ -37,609 +40,480 @@ public:
     Vector3 operator*(float number) const { return Vector3(x * number, y * number, z * number); }
 };
 
-// Set socket timeout for send and receive operations
-void set_socket_timeout(SOCKET sock, int timeout_ms) {
+// Set socket options
+void set_socket_options(SOCKET sock, int timeout_ms) {
     DWORD timeout = timeout_ms;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+    int buffer_size = 8 * 1024 * 1024; // 8MB
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&buffer_size, sizeof(buffer_size));
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&buffer_size, sizeof(buffer_size));
 }
 
-// Clear socket buffer to prevent residual data
-void clear_socket_buffer(SOCKET sock) {
-    char temp_buffer[1024];
-    DWORD timeout = 100; // 100ms timeout for clearing
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-    while (recv(sock, temp_buffer, sizeof(temp_buffer), 0) > 0) {}
-    set_socket_timeout(sock, 60000); // Restore to 60 seconds
+// Check if socket is valid
+bool is_socket_valid(SOCKET sock) {
+    int error = 0;
+    int len = sizeof(error);
+    return getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&error, &len) == 0 && error == 0;
 }
 
-// Reconnect to server if connection is lost
-SOCKET reconnect(struct sockaddr_in& serv_addr, const std::string& ip_address) {
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) {
-        std::cerr << "Socket creation error: " << WSAGetLastError() << "\n";
-        return INVALID_SOCKET;
+// Recursively list files, skipping 0KB files
+void list_files_recursive(const std::string& path, std::string& file_list) {
+    try {
+        for (const auto& entry : fs::recursive_directory_iterator(path)) {
+            if (entry.is_regular_file() && fs::file_size(entry.path()) > 0) {
+                file_list += entry.path().string() + "\n";
+            }
+            else if (entry.is_regular_file()) {
+                std::cout << "Skipped 0KB file: " << entry.path().string() << "\n";
+            }
+        }
     }
-    set_socket_timeout(sock, 60000);
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == SOCKET_ERROR) {
-        std::cerr << "Reconnection failed: " << WSAGetLastError() << "\n";
-        closesocket(sock);
-        return INVALID_SOCKET;
+    catch (const fs::filesystem_error& e) {
+        file_list += "Error accessing directory: " + std::string(e.what()) + "\n";
     }
-    char buffer[4096] = { 0 };
-    int valread = recv(sock, buffer, sizeof(buffer) - 1, 0);
-    if (valread > 0) {
-        buffer[valread] = '\0';
-        std::cout << "Reconnected to server: " << buffer << "\n";
+}
+
+// Simple RLE compression for RGB data
+bool compress_rle(const unsigned char* input, int input_size, std::vector<unsigned char>& output) {
+    output.clear();
+    output.reserve(input_size / 2);
+    int i = 0;
+    while (i < input_size) {
+        if (i + 2 >= input_size) {
+            std::cerr << "Incomplete pixel data at index " << i << "\n";
+            return false;
+        }
+        unsigned char pixel[3] = { input[i], input[i + 1], input[i + 2] };
+        int count = 1;
+        i += 3;
+        while (i + 2 < input_size && count < 255 &&
+            input[i] == pixel[0] && input[i + 1] == pixel[1] && input[i + 2] == pixel[2]) {
+            count++;
+            i += 3;
+        }
+        output.push_back((unsigned char)count);
+        output.push_back(pixel[0]);
+        output.push_back(pixel[1]);
+        output.push_back(pixel[2]);
     }
-    else {
-        std::cerr << "Failed to receive server acknowledgment: " << WSAGetLastError() << "\n";
-        closesocket(sock);
-        return INVALID_SOCKET;
+    std::cout << "RLE compressed " << input_size << " bytes to " << output.size() << " bytes\n";
+    return true;
+}
+
+// Capture screen
+bool capture_screen(std::vector<unsigned char>& data, int& width, int& height, int target_width, int target_height) {
+    HDC hScreenDC = GetDC(NULL);
+    if (!hScreenDC) {
+        std::cerr << "Failed to get screen DC: " << GetLastError() << "\n";
+        return false;
     }
-    return sock;
+    HDC hMemoryDC = CreateCompatibleDC(hScreenDC);
+    if (!hMemoryDC) {
+        std::cerr << "Failed to create memory DC: " << GetLastError() << "\n";
+        ReleaseDC(NULL, hScreenDC);
+        return false;
+    }
+    int screen_width = GetSystemMetrics(SM_CXSCREEN);
+    int screen_height = GetSystemMetrics(SM_CYSCREEN);
+    width = target_width;
+    height = target_height;
+    HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, width, height);
+    if (!hBitmap) {
+        std::cerr << "Failed to create bitmap: " << GetLastError() << "\n";
+        DeleteDC(hMemoryDC);
+        ReleaseDC(NULL, hScreenDC);
+        return false;
+    }
+    HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemoryDC, hBitmap);
+
+    SetStretchBltMode(hMemoryDC, HALFTONE);
+    if (!StretchBlt(hMemoryDC, 0, 0, width, height, hScreenDC, 0, 0, screen_width, screen_height, SRCCOPY)) {
+        std::cerr << "StretchBlt failed: " << GetLastError() << "\n";
+        SelectObject(hMemoryDC, hOldBitmap);
+        DeleteObject(hBitmap);
+        DeleteDC(hMemoryDC);
+        ReleaseDC(NULL, hScreenDC);
+        return false;
+    }
+
+    BITMAPINFO bmi = { 0 };
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 24;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    std::vector<unsigned char> bmp_data(width * height * 3);
+    if (!GetDIBits(hMemoryDC, hBitmap, 0, height, bmp_data.data(), &bmi, DIB_RGB_COLORS)) {
+        std::cerr << "GetDIBits failed: " << GetLastError() << "\n";
+        SelectObject(hMemoryDC, hOldBitmap);
+        DeleteObject(hBitmap);
+        DeleteDC(hMemoryDC);
+        ReleaseDC(NULL, hScreenDC);
+        return false;
+    }
+
+    if (!compress_rle(bmp_data.data(), bmp_data.size(), data)) {
+        std::cerr << "RLE compression failed\n";
+        SelectObject(hMemoryDC, hOldBitmap);
+        DeleteObject(hBitmap);
+        DeleteDC(hMemoryDC);
+        ReleaseDC(NULL, hScreenDC);
+        return false;
+    }
+
+    SelectObject(hMemoryDC, hOldBitmap);
+    DeleteObject(hBitmap);
+    DeleteDC(hMemoryDC);
+    ReleaseDC(NULL, hScreenDC);
+    return true;
+}
+
+void stream_screen(SOCKET& client_socket, volatile bool& stop_streaming, int target_width, int target_height) {
+    set_socket_options(client_socket, 5000); // 5s timeout
+    int FPS = 10; // Start at 10 FPS
+    int frame_interval_ms = 1000 / FPS;
+    int frame_count = 0;
+    auto stream_start = std::chrono::steady_clock::now();
+
+    while (!stop_streaming) {
+        if (!is_socket_valid(client_socket)) {
+            std::cerr << "Socket invalid in stream_screen, stopping\n";
+            stop_streaming = true;
+            break;
+        }
+
+        auto start_time = std::chrono::steady_clock::now();
+        std::vector<unsigned char> data;
+        int width, height;
+        if (!capture_screen(data, width, height, target_width, target_height)) {
+            std::cerr << "Failed to capture screen\n";
+            std::this_thread::sleep_for(std::chrono::milliseconds(frame_interval_ms));
+            continue;
+        }
+
+        std::streamsize size = data.size();
+        char type = 7;
+        int header[3] = { width, height, (int)size };
+
+        int retries = 3;
+        bool sent = false;
+        while (retries > 0 && !sent && !stop_streaming) {
+            if (!is_socket_valid(client_socket)) {
+                std::cerr << "Socket became invalid during send attempt for frame " << frame_count << "\n";
+                stop_streaming = true;
+                break;
+            }
+            if (send(client_socket, &type, 1, 0) == SOCKET_ERROR ||
+                send(client_socket, (char*)header, sizeof(header), 0) == SOCKET_ERROR ||
+                send(client_socket, (char*)data.data(), size, 0) == SOCKET_ERROR) {
+                std::cerr << "Send failed for frame " << frame_count << ": " << WSAGetLastError() << " (retry " << (4 - retries) << "/3)\n";
+                retries--;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            else {
+                sent = true;
+                std::cout << "Sent frame " << frame_count << ": " << size << " bytes (" << width << "x" << height << ")\n";
+            }
+        }
+        if (!sent) {
+            std::cerr << "Failed to send frame " << frame_count << " after 3 retries\n";
+            stop_streaming = true;
+            break;
+        }
+        frame_count++;
+
+        auto elapsed_total = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - stream_start).count();
+        if (elapsed_total > 5 && frame_count / elapsed_total < 8) {
+            FPS = max(5, FPS - 1);
+            frame_interval_ms = 1000 / FPS;
+            std::cout << "Reduced FPS to " << FPS << " due to low performance\n";
+        }
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+        int sleep_time = frame_interval_ms - elapsed;
+        if (sleep_time > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time));
+        }
+    }
+
+    std::cout << "Stream screen thread exiting\n";
+}
+
+void handle_client(SOCKET client_socket) {
+    set_socket_options(client_socket, 5000); // 5s timeout
+    char buffer[8192] = { 0 };
+    volatile bool stop_streaming = false;
+    int target_width = 640, target_height = 480; // Default resolution
+
+    while (!stop_streaming) {
+        if (!is_socket_valid(client_socket)) {
+            std::cerr << "Client socket invalid, closing connection\n";
+            break;
+        }
+
+        char type;
+        int valread = recv(client_socket, &type, 1, 0);
+        if (valread == SOCKET_ERROR) {
+            std::cerr << "Recv type failed: " << WSAGetLastError() << "\n";
+            break;
+        }
+        if (valread == 0) {
+            std::cout << "Client disconnected cleanly\n";
+            break;
+        }
+        std::cout << "Received command type: " << (int)type << "\n";
+
+        if (type == 2) { // Vector2
+            double data[2];
+            valread = recv(client_socket, (char*)data, sizeof(data), 0);
+            if (valread != sizeof(data)) {
+                std::cerr << "Incomplete Vector2 data received: " << WSAGetLastError() << "\n";
+                continue;
+            }
+            Vector2 vec(data[0], data[1]);
+            std::cout << "Received Vector2: (" << vec.x << ", " << vec.y << ")\n";
+            if (send(client_socket, &type, 1, 0) == SOCKET_ERROR || send(client_socket, (char*)data, sizeof(data), 0) == SOCKET_ERROR) {
+                std::cerr << "Send failed for Vector2: " << WSAGetLastError() << "\n";
+                break;
+            }
+        }
+        else if (type == 3) { // Vector3
+            double data[3];
+            valread = recv(client_socket, (char*)data, sizeof(data), 0);
+            if (valread != sizeof(data)) {
+                std::cerr << "Incomplete Vector3 data received: " << WSAGetLastError() << "\n";
+                continue;
+            }
+            Vector3 vec(data[0], data[1], data[2]);
+            std::cout << "Received Vector3: (" << vec.x << ", " << vec.y << ", " << vec.z << ")\n";
+            if (send(client_socket, &type, 1, 0) == SOCKET_ERROR || send(client_socket, (char*)data, sizeof(data), 0) == SOCKET_ERROR) {
+                std::cerr << "Send failed for Vector3: " << WSAGetLastError() << "\n";
+                break;
+            }
+        }
+        else if (type == 4) { // List files
+            char path_buffer[1024];
+            valread = recv(client_socket, path_buffer, sizeof(path_buffer) - 1, 0);
+            if (valread <= 0) {
+                std::cerr << "Failed to receive path: " << WSAGetLastError() << "\n";
+                continue;
+            }
+            path_buffer[valread] = '\0';
+            std::string path = path_buffer;
+            std::cout << "Listing directory: " << path << "\n";
+
+            if (path.empty() || path == " ") {
+                path = fs::current_path().string();
+            }
+
+            std::string file_list;
+            try {
+                if (!fs::exists(path) || !fs::is_directory(path)) {
+                    file_list = "Error: Invalid or non-existent directory";
+                }
+                else {
+                    list_files_recursive(path, file_list);
+                    if (file_list.empty()) {
+                        file_list = "Directory is empty or contains only 0KB files";
+                    }
+                }
+            }
+            catch (const fs::filesystem_error& e) {
+                file_list = "Error accessing directory: " + std::string(e.what());
+            }
+
+            if (send(client_socket, &type, 1, 0) == SOCKET_ERROR || send(client_socket, file_list.c_str(), file_list.size() + 1, 0) == SOCKET_ERROR) {
+                std::cerr << "Send failed for file list: " << WSAGetLastError() << "\n";
+                break;
+            }
+            std::cout << "Sent file list with " << std::count(file_list.begin(), file_list.end(), '\n') << " files\n";
+        }
+        else if (type == 5) { // Retrieve file
+            char path_buffer[1024];
+            valread = recv(client_socket, path_buffer, sizeof(path_buffer) - 1, 0);
+            if (valread <= 0) {
+                std::cerr << "Failed to receive file path: " << WSAGetLastError() << "\n";
+                continue;
+            }
+            path_buffer[valread] = '\0';
+            std::string file_path = path_buffer;
+            std::cout << "Requested file: " << file_path << "\n";
+
+            std::string error;
+            std::streamsize size = 0;
+            std::vector<char> file_buffer;
+            bool file_valid = true;
+
+            try {
+                if (!fs::exists(file_path)) {
+                    error = "Error: File does not exist: " + file_path;
+                    file_valid = false;
+                }
+                else if (fs::is_directory(file_path)) {
+                    error = "Error: Path is a directory: " + file_path;
+                    file_valid = false;
+                }
+                else if (!fs::is_regular_file(file_path)) {
+                    error = "Error: Path is not a regular file: " + file_path;
+                    file_valid = false;
+                }
+                else if (fs::file_size(file_path) == 0) {
+                    error = "Error: File is empty (0KB): " + file_path;
+                    file_valid = false;
+                }
+                else {
+                    std::ifstream file(file_path, std::ios::binary | std::ios::ate);
+                    if (!file.is_open()) {
+                        error = "Error: Cannot open file (permissions or locked): " + file_path;
+                        file_valid = false;
+                    }
+                    else {
+                        size = file.tellg();
+                        std::cout << "File size: " << size << " bytes\n";
+                        file.seekg(0, std::ios::beg);
+                        file_buffer.resize(size);
+                        file.read(file_buffer.data(), size);
+                        file.close();
+                    }
+                }
+            }
+            catch (const fs::filesystem_error& e) {
+                error = "Error: Filesystem error: " + std::string(e.what());
+                file_valid = false;
+            }
+
+            if (!file_valid) {
+                if (send(client_socket, &type, 1, 0) == SOCKET_ERROR ||
+                    send(client_socket, (char*)&size, sizeof(size), 0) == SOCKET_ERROR ||
+                    send(client_socket, error.c_str(), error.size() + 1, 0) == SOCKET_ERROR) {
+                    std::cerr << "Send failed for file error: " << WSAGetLastError() << "\n";
+                    break;
+                }
+                std::cout << "Sent error: " << error << "\n";
+                continue;
+            }
+
+            if (send(client_socket, &type, 1, 0) == SOCKET_ERROR ||
+                send(client_socket, (char*)&size, sizeof(size), 0) == SOCKET_ERROR ||
+                send(client_socket, file_buffer.data(), size, 0) == SOCKET_ERROR) {
+                std::cerr << "Send failed for file: " << file_path << " (" << WSAGetLastError() << ")\n";
+                break;
+            }
+            std::cout << "Sent file: " << file_path << " (" << size << " bytes)\n";
+        }
+        else if (type == 7) { // Start screen streaming
+            int resolution[2];
+            valread = recv(client_socket, (char*)resolution, sizeof(resolution), 0);
+            if (valread != sizeof(resolution)) {
+                std::cerr << "Failed to receive resolution: " << WSAGetLastError() << "\n";
+                continue;
+            }
+            target_width = resolution[0];
+            target_height = resolution[1];
+            std::cout << "Streaming at resolution: " << target_width << "x" << target_height << "\n";
+            stop_streaming = false;
+            std::cout << "Starting screen streaming thread\n";
+            std::thread(stream_screen, std::ref(client_socket), std::ref(stop_streaming), target_width, target_height).detach();
+            std::cout << "Started screen streaming\n";
+        }
+        else if (type == 8) { // Stop screen streaming
+            stop_streaming = true;
+            std::cout << "Received stop command\n";
+            if (send(client_socket, &type, 1, 0) == SOCKET_ERROR) {
+                std::cerr << "Send failed for stop streaming: " << WSAGetLastError() << "\n";
+                break;
+            }
+            std::cout << "Stopped screen streaming\n";
+        }
+        else {
+            std::cerr << "Unknown type received: " << (int)type << "\n";
+            continue;
+        }
+    }
+
+    stop_streaming = true;
+    if (is_socket_valid(client_socket)) {
+        closesocket(client_socket);
+    }
 }
 
 int main() {
     WSADATA wsaData;
-    SOCKET sock = INVALID_SOCKET;
-    struct sockaddr_in serv_addr;
-    char buffer[16384] = { 0 }; // Increased buffer size
-    std::string ip_address;
+    SOCKET server_fd;
+    struct sockaddr_in server_addr;
+    char hostname[256];
+    char ip_buffer[INET_ADDRSTRLEN];
 
-    // Initialize Winsock
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         std::cerr << "WSAStartup failed: " << WSAGetLastError() << "\n";
         return 1;
     }
 
-    // Get server IP from user
-    std::cout << "Enter server IP address: ";
-    std::getline(std::cin, ip_address);
+    gethostname(hostname, sizeof(hostname));
+    struct hostent* host = gethostbyname(hostname);
+    if (host == nullptr) {
+        strcpy(ip_buffer, "127.0.0.1");
+    }
+    else {
+        strcpy(ip_buffer, inet_ntoa(*(struct in_addr*)host->h_addr_list[0]));
+    }
 
-    // Create socket
-    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) {
-        std::cerr << "Socket creation error: " << WSAGetLastError() << "\n";
+    server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (server_fd == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed: " << WSAGetLastError() << "\n";
         WSACleanup();
         return 1;
     }
 
-    // Set socket timeouts (60 seconds)
-    set_socket_timeout(sock, 60000);
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    set_socket_options(server_fd, 5000);
 
-    // Configure server address
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(8080);
-    if (inet_pton(AF_INET, ip_address.c_str(), &serv_addr.sin_addr) <= 0) {
-        std::cerr << "Invalid address: " << WSAGetLastError() << "\n";
-        closesocket(sock);
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(8080);
+
+    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
+        std::cerr << "Bind failed: " << WSAGetLastError() << "\n";
+        closesocket(server_fd);
         WSACleanup();
         return 1;
     }
 
-    // Connect to server
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == SOCKET_ERROR) {
-        std::cerr << "Connection failed: " << WSAGetLastError() << "\n";
-        closesocket(sock);
+    if (listen(server_fd, 3) == SOCKET_ERROR) {
+        std::cerr << "Listen failed: " << WSAGetLastError() << "\n";
+        closesocket(server_fd);
         WSACleanup();
         return 1;
     }
 
-    // Receive connection acknowledgment
-    int valread = recv(sock, buffer, sizeof(buffer) - 1, 0);
-    if (valread > 0) {
-        buffer[valread] = '\0';
-        std::cout << "Server: " << buffer << "\n";
-    }
-    else if (valread == SOCKET_ERROR) {
-        std::cerr << "Recv failed: " << WSAGetLastError() << "\n";
-        closesocket(sock);
-        WSACleanup();
-        return 1;
-    }
-
-    // Test vectors
-    Vector2 vec2(1.5, 2.5);
-    Vector3 vec3(3.0, 4.0, 5.0);
-    std::string input;
+    std::cout << "Server running. Connect client to IP: " << ip_buffer << ", Port: 8080\n";
 
     while (true) {
-        std::cout << "Enter command ('2' for Vector2, '3' for Vector3, 'list' for file list, 'get' for file retrieval, 'move' to move all files to new folder, 'exit' to quit): ";
-        std::getline(std::cin, input);
-        ULONGLONG start_time = GetTickCount64();
-
-        if (input == "exit") {
-            break;
-        }
-        else if (input == "2") {
-            char type = 2;
-            double data[2] = { vec2.x, vec2.y };
-            std::cout << "Sending Vector2: (" << vec2.x << ", " << vec2.y << ")\n";
-            clear_socket_buffer(sock);
-            if (send(sock, &type, 1, 0) == SOCKET_ERROR || send(sock, (char*)data, sizeof(data), 0) == SOCKET_ERROR) {
-                std::cerr << "Send failed: " << WSAGetLastError() << "\n";
-                continue;
-            }
-
-            char echo_type;
-            double echo_data[2];
-            if (recv(sock, &echo_type, 1, 0) != 1 || echo_type != 2 || recv(sock, (char*)echo_data, sizeof(echo_data), 0) != sizeof(echo_data)) {
-                std::cerr << "Failed to receive Vector2 echo: " << WSAGetLastError() << "\n";
-                continue;
-            }
-            std::cout << "Received Vector2 echo: (" << echo_data[0] << ", " << echo_data[1] << ")\n";
-        }
-        else if (input == "3") {
-            char type = 3;
-            double data[3] = { vec3.x, vec3.y, vec3.z };
-            std::cout << "Sending Vector3: (" << vec3.x << ", " << vec3.y << ", " << vec3.z << ")\n";
-            clear_socket_buffer(sock);
-            if (send(sock, &type, 1, 0) == SOCKET_ERROR || send(sock, (char*)data, sizeof(data), 0) == SOCKET_ERROR) {
-                std::cerr << "Send failed: " << WSAGetLastError() << "\n";
-                continue;
-            }
-
-            char echo_type;
-            double echo_data[3];
-            if (recv(sock, &echo_type, 1, 0) != 1 || echo_type != 3 || recv(sock, (char*)echo_data, sizeof(echo_data), 0) != sizeof(echo_data)) {
-                std::cerr << "Failed to receive Vector3 echo: " << WSAGetLastError() << "\n";
-                continue;
-            }
-            std::cout << "Received Vector3 echo: (" << echo_data[0] << ", " << echo_data[1] << ", " << echo_data[2] << ")\n";
-        }
-        else if (input == "list") {
-            char type = 4;
-            std::string path;
-            std::cout << "Enter directory path to list (leave empty for current directory): ";
-            std::getline(std::cin, path);
-            if (path.empty()) {
-                path = " ";
-            }
-            bool list_success = false;
-            int retries = 3;
-            while (retries > 0 && !list_success) {
-                if (send(sock, &type, 1, 0) == SOCKET_ERROR || send(sock, path.c_str(), path.size() + 1, 0) == SOCKET_ERROR) {
-                    std::cerr << "Send failed for list command: " << WSAGetLastError() << "\n";
-                    retries--;
-                    if (retries == 0) {
-                        std::cerr << "Failed to send list command after 3 retries\n";
-                        break;
-                    }
-                    // Attempt to reconnect
-                    closesocket(sock);
-                    sock = reconnect(serv_addr, ip_address);
-                    if (sock == INVALID_SOCKET) {
-                        std::cerr << "Reconnection failed, aborting list command\n";
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                    continue;
-                }
-
-                char echo_type;
-                if (recv(sock, &echo_type, 1, 0) != 1 || echo_type != 4) {
-                    std::cerr << "Invalid response type for list command: " << WSAGetLastError() << "\n";
-                    retries--;
-                    if (retries == 0) {
-                        std::cerr << "Failed to receive list response after 3 retries\n";
-                        break;
-                    }
-                    // Attempt to reconnect
-                    closesocket(sock);
-                    sock = reconnect(serv_addr, ip_address);
-                    if (sock == INVALID_SOCKET) {
-                        std::cerr << "Reconnection failed, aborting list command\n";
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                    continue;
-                }
-
-                char file_buffer[16384] = { 0 }; // Increased buffer size
-                valread = recv(sock, file_buffer, sizeof(file_buffer) - 1, 0);
-                if (valread <= 0) {
-                    std::cerr << "Failed to receive file list: " << WSAGetLastError() << "\n";
-                    retries--;
-                    if (retries == 0) {
-                        std::cerr << "Failed to receive file list after 3 retries\n";
-                        break;
-                    }
-                    // Attempt to reconnect
-                    closesocket(sock);
-                    sock = reconnect(serv_addr, ip_address);
-                    if (sock == INVALID_SOCKET) {
-                        std::cerr << "Reconnection failed, aborting list command\n";
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                    continue;
-                }
-                file_buffer[valread] = '\0';
-                std::cout << "Files in directory:\n" << file_buffer << "\n";
-                list_success = true;
-            }
-            if (!list_success) {
-                continue;
-            }
-        }
-        else if (input == "get") {
-            char type = 5;
-            std::string file_path;
-            std::cout << "Enter file path to retrieve: ";
-            std::getline(std::cin, file_path);
-            clear_socket_buffer(sock);
-            if (send(sock, &type, 1, 0) == SOCKET_ERROR || send(sock, file_path.c_str(), file_path.size() + 1, 0) == SOCKET_ERROR) {
-                std::cerr << "Send failed: " << WSAGetLastError() << "\n";
-                continue;
-            }
-
-            char echo_type;
-            if (recv(sock, &echo_type, 1, 0) != 1 || echo_type != 5) {
-                std::cerr << "Invalid response type: " << WSAGetLastError() << "\n";
-                continue;
-            }
-
-            std::streamsize size;
-            valread = recv(sock, (char*)&size, sizeof(size), 0);
-            if (valread != sizeof(size)) {
-                std::cerr << "Failed to receive file size: " << WSAGetLastError() << "\n";
-                continue;
-            }
-
-            if (size == 0) {
-                char error_buffer[1024] = { 0 };
-                valread = recv(sock, error_buffer, sizeof(error_buffer) - 1, 0);
-                if (valread > 0) {
-                    error_buffer[valread] = '\0';
-                    std::cout << "Server error: " << error_buffer << "\n";
-                }
-                else {
-                    std::cout << "Server error: Empty error response\n";
-                }
-                continue;
-            }
-
-            std::vector<char> file_buffer(size);
-            int total_received = 0;
-            while (total_received < size) {
-                valread = recv(sock, file_buffer.data() + total_received, size - total_received, 0);
-                if (valread <= 0) {
-                    std::cerr << "Failed to receive file data: " << WSAGetLastError() << "\n";
-                    break;
-                }
-                total_received += valread;
-            }
-            if (total_received != size) {
-                std::cerr << "Incomplete file data received\n";
-                continue;
-            }
-
-            std::string filename = file_path.substr(file_path.find_last_of("/\\") + 1);
-            std::ofstream outfile(filename, std::ios::binary);
-            if (!outfile) {
-                std::cerr << "Failed to save file: " << filename << "\n";
-                continue;
-            }
-            outfile.write(file_buffer.data(), size);
-            outfile.close();
-            std::cout << "File saved as: " << filename << " (" << size << " bytes)\n";
-        }
-        else if (input == "move") {
-            // Create folder first
-            std::string folder_name;
-            std::cout << "Enter name for new folder to store files: ";
-            std::getline(std::cin, folder_name);
-            if (folder_name.empty()) {
-                folder_name = "ServerFiles_" + std::to_string(start_time);
-            }
-            try {
-                if (fs::exists(folder_name)) {
-                    std::cerr << "Folder already exists: " << folder_name << ". Please choose a different name.\n";
-                    continue;
-                }
-                fs::create_directory(folder_name);
-                std::cout << "Created folder: " << folder_name << "\n";
-            }
-            catch (const fs::filesystem_error& e) {
-                std::cerr << "Failed to create folder: " << e.what() << "\n";
-                continue;
-            }
-
-            // Get file list with retries
-            std::vector<std::string> files;
-            std::string base_path;
-            std::cout << "Enter directory path to list (leave empty for current directory): ";
-            std::getline(std::cin, base_path);
-            if (base_path.empty()) {
-                base_path = " ";
-            }
-            bool list_success = false;
-            int retries = 3;
-            while (retries > 0 && !list_success) {
-                char type = 4;
-                if (send(sock, &type, 1, 0) == SOCKET_ERROR || send(sock, base_path.c_str(), base_path.size() + 1, 0) == SOCKET_ERROR) {
-                    std::cerr << "Send failed for list command: " << WSAGetLastError() << "\n";
-                    retries--;
-                    if (retries == 0) {
-                        std::cerr << "Failed to send list command after 3 retries\n";
-                        break;
-                    }
-                    // Attempt to reconnect
-                    closesocket(sock);
-                    sock = reconnect(serv_addr, ip_address);
-                    if (sock == INVALID_SOCKET) {
-                        std::cerr << "Reconnection failed, aborting move command\n";
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                    continue;
-                }
-
-                char echo_type;
-                if (recv(sock, &echo_type, 1, 0) != 1 || echo_type != 4) {
-                    std::cerr << "Invalid response type for list command: " << WSAGetLastError() << "\n";
-                    retries--;
-                    if (retries == 0) {
-                        std::cerr << "Failed to receive list response after 3 retries\n";
-                        break;
-                    }
-                    // Attempt to reconnect
-                    closesocket(sock);
-                    sock = reconnect(serv_addr, ip_address);
-                    if (sock == INVALID_SOCKET) {
-                        std::cerr << "Reconnection failed, aborting move command\n";
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                    continue;
-                }
-
-                char file_buffer[16384] = { 0 }; // Increased buffer size
-                valread = recv(sock, file_buffer, sizeof(file_buffer) - 1, 0);
-                if (valread <= 0) {
-                    std::cerr << "Failed to receive file list: " << WSAGetLastError() << "\n";
-                    retries--;
-                    if (retries == 0) {
-                        std::cerr << "Failed to receive file list after 3 retries\n";
-                        break;
-                    }
-                    // Attempt to reconnect
-                    closesocket(sock);
-                    sock = reconnect(serv_addr, ip_address);
-                    if (sock == INVALID_SOCKET) {
-                        std::cerr << "Reconnection failed, aborting move command\n";
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                    continue;
-                }
-                file_buffer[valread] = '\0';
-
-                // Parse file list
-                std::string file_list = file_buffer;
-                if (file_list.empty() || file_list == "Directory is empty or contains only 0KB files" || file_list.find("Error:") == 0) {
-                    std::cout << "No non-empty files to move: " << file_list << "\n";
-                    list_success = true;
-                    break;
-                }
-
-                std::string file;
-                for (char c : file_list) {
-                    if (c == '\n' && !file.empty()) {
-                        files.push_back(file);
-                        file.clear();
-                    }
-                    else if (c != '\n') {
-                        file += c;
-                    }
-                }
-                if (!file.empty()) {
-                    files.push_back(file);
-                }
-                list_success = true;
-            }
-            if (!list_success) {
-                continue;
-            }
-
-            // Retrieve and save each file
-            int successful_transfers = 0;
-            int total_files = files.size();
-            for (size_t i = 0; i < files.size(); ++i) {
-                const auto& file_path = files[i];
-                std::cout << "[" << (i + 1) << "/" << total_files << "] Attempting to retrieve: " << file_path << "\n";
-                bool success = false;
-                int file_retries = 3;
-                while (file_retries > 0 && !success) {
-                    clear_socket_buffer(sock);
-                    char type = 5;
-                    if (send(sock, &type, 1, 0) == SOCKET_ERROR || send(sock, file_path.c_str(), file_path.size() + 1, 0) == SOCKET_ERROR) {
-                        std::cerr << "Send failed for file: " << file_path << " (" << WSAGetLastError() << ")\n";
-                        file_retries--;
-                        if (file_retries == 0) {
-                            std::cerr << "Failed to send file request for " << file_path << " after 3 retries\n";
-                            break;
-                        }
-                        // Attempt to reconnect
-                        closesocket(sock);
-                        sock = reconnect(serv_addr, ip_address);
-                        if (sock == INVALID_SOCKET) {
-                            std::cerr << "Reconnection failed, skipping file: " << file_path << "\n";
-                            break;
-                        }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                        continue;
-                    }
-
-                    char echo_type;
-                    valread = recv(sock, &echo_type, 1, 0);
-                    if (valread != 1 || echo_type != 5) {
-                        std::cerr << "Invalid response type for file: " << file_path << " (" << WSAGetLastError() << ")\n";
-                        file_retries--;
-                        if (file_retries == 0) {
-                            std::cerr << "Failed to receive file response for " << file_path << " after 3 retries\n";
-                            break;
-                        }
-                        // Attempt to reconnect
-                        closesocket(sock);
-                        sock = reconnect(serv_addr, ip_address);
-                        if (sock == INVALID_SOCKET) {
-                            std::cerr << "Reconnection failed, skipping file: " << file_path << "\n";
-                            break;
-                        }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                        continue;
-                    }
-
-                    std::streamsize size;
-                    valread = recv(sock, (char*)&size, sizeof(size), 0);
-                    if (valread != sizeof(size)) {
-                        std::cerr << "Failed to receive file size for: " << file_path << " (" << WSAGetLastError() << ")\n";
-                        file_retries--;
-                        if (file_retries == 0) {
-                            std::cerr << "Failed to receive file size for " << file_path << " after 3 retries\n";
-                            break;
-                        }
-                        // Attempt to reconnect
-                        closesocket(sock);
-                        sock = reconnect(serv_addr, ip_address);
-                        if (sock == INVALID_SOCKET) {
-                            std::cerr << "Reconnection failed, skipping file: " << file_path << "\n";
-                            break;
-                        }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                        continue;
-                    }
-
-                    if (size == 0) {
-                        char error_buffer[1024] = { 0 };
-                        valread = recv(sock, error_buffer, sizeof(error_buffer) - 1, 0);
-                        if (valread > 0) {
-                            error_buffer[valread] = '\0';
-                            std::cout << "Server error for " << file_path << ": " << error_buffer << "\n";
-                        }
-                        else {
-                            std::cout << "Server error for " << file_path << ": Empty error response\n";
-                        }
-                        file_retries--;
-                        if (file_retries == 0) {
-                            std::cerr << "Failed to retrieve file " << file_path << " after 3 retries\n";
-                            break;
-                        }
-                        // Attempt to reconnect
-                        closesocket(sock);
-                        sock = reconnect(serv_addr, ip_address);
-                        if (sock == INVALID_SOCKET) {
-                            std::cerr << "Reconnection failed, skipping file: " << file_path << "\n";
-                            break;
-                        }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                        continue;
-                    }
-
-                    // Validate file size
-                    if (size > 1024 * 1024 * 500) { // Limit to 500MB
-                        std::cerr << "File too large: " << file_path << " (" << size << " bytes)\n";
-                        file_retries--;
-                        if (file_retries == 0) {
-                            std::cerr << "File " << file_path << " too large after 3 retries\n";
-                            break;
-                        }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                        continue;
-                    }
-
-                    std::vector<char> file_buffer(size);
-                    int total_received = 0;
-                    while (total_received < size) {
-                        valread = recv(sock, file_buffer.data() + total_received, size - total_received, 0);
-                        if (valread <= 0) {
-                            std::cerr << "Failed to receive file data for: " << file_path << " (" << WSAGetLastError() << ")\n";
-                            break;
-                        }
-                        total_received += valread;
-                    }
-                    if (total_received != size) {
-                        std::cerr << "Incomplete file data received for: " << file_path << "\n";
-                        file_retries--;
-                        if (file_retries == 0) {
-                            std::cerr << "Failed to receive file data for " << file_path << " after 3 retries\n";
-                            break;
-                        }
-                        // Attempt to reconnect
-                        closesocket(sock);
-                        sock = reconnect(serv_addr, ip_address);
-                        if (sock == INVALID_SOCKET) {
-                            std::cerr << "Reconnection failed, skipping file: " << file_path << "\n";
-                            break;
-                        }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                        continue;
-                    }
-
-                    // Create directory structure relative to base_path
-                    std::string relative_path = file_path;
-                    if (base_path != " ") {
-                        size_t pos = file_path.find(base_path);
-                        if (pos != std::string::npos) {
-                            relative_path = file_path.substr(pos + base_path.size());
-                            if (relative_path[0] == '\\') {
-                                relative_path = relative_path.substr(1);
-                            }
-                        }
-                    }
-                    std::string save_path = folder_name + "\\" + relative_path;
-                    std::string save_dir = save_path.substr(0, save_path.find_last_of("\\"));
-                    if (!save_dir.empty()) {
-                        try {
-                            fs::create_directories(save_dir);
-                        }
-                        catch (const fs::filesystem_error& e) {
-                            std::cerr << "Failed to create directory " << save_dir << ": " << e.what() << "\n";
-                            file_retries--;
-                            if (file_retries == 0) {
-                                std::cerr << "Failed to create directory for " << file_path << " after 3 retries\n";
-                                break;
-                            }
-                            continue;
-                        }
-                    }
-
-                    std::ofstream outfile(save_path, std::ios::binary);
-                    if (!outfile) {
-                        std::cerr << "Failed to save file: " << save_path << "\n";
-                        file_retries--;
-                        if (file_retries == 0) {
-                            std::cerr << "Failed to save file " << file_path << " after 3 retries\n";
-                            break;
-                        }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                        continue;
-                    }
-                    outfile.write(file_buffer.data(), size);
-                    outfile.close();
-                    std::cout << "File saved as: " << save_path << " (" << size << " bytes)\n";
-                    success = true;
-                    successful_transfers++;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-                }
-                if (!success) {
-                    std::cerr << "Failed to transfer " << file_path << " after 3 retries\n";
-                }
-            }
-            std::cout << "Moved " << successful_transfers << " of " << total_files << " files to folder: " << folder_name << "\n";
-        }
-        else {
-            std::cout << "Invalid input. Use '2', '3', 'list', 'get', 'move', or 'exit'.\n";
+        struct sockaddr_in client_addr;
+        int addr_len = sizeof(client_addr);
+        SOCKET new_socket = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len);
+        if (new_socket == INVALID_SOCKET) {
+            std::cerr << "Accept failed: " << WSAGetLastError() << "\n";
             continue;
         }
 
-        ULONGLONG end_time = GetTickCount64();
-        std::cout << "Round-trip delay: " << (end_time - start_time) << " ms\n";
+        std::cout << "Client connected\n";
+        if (send(new_socket, "Connected to server\n", 20, 0) == SOCKET_ERROR) {
+            std::cerr << "Send failed: " << WSAGetLastError() << "\n";
+            closesocket(new_socket);
+            continue;
+        }
+
+        std::thread(handle_client, new_socket).detach();
     }
 
-    closesocket(sock);
+    closesocket(server_fd);
     WSACleanup();
     return 0;
 }
